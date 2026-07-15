@@ -312,7 +312,7 @@ class XarrayPushdownDataset(pads.Dataset):
         geometry: tuple[str, str] | None = None,
         geometry_encoding: str = "wkb",
         geometry_crs: str | None = "OGC:CRS84",
-        dict_coords: bool = False,
+        dict_coords: bool | str = False,
         coord_arrays: dict[str, np.ndarray] | None = None,
         _iteration_callback: (
             Callable[[Block, list[str] | None], None] | None
@@ -1067,7 +1067,7 @@ def arrow_dataset(
     geometry: tuple[str, str] | None = None,
     geometry_encoding: str = "wkb",
     geometry_crs: str | None = "OGC:CRS84",
-    dict_coords: bool = False,
+    dict_coords: bool | str = False,
 ) -> XarrayPushdownDataset:
     """A pushdown-capable ``pyarrow.dataset.Dataset`` view of ``ds``.
 
@@ -1119,9 +1119,15 @@ def arrow_dataset(
             indices instead of densely repeated values — ~10x cheaper
             batch production that scales across producer threads, at
             ~40% fewer coordinate bytes. Ingestion is engine-dependent:
-            DuckDB and DataFusion consume dictionaries natively; Polars
-            pays a decode penalty, so leave this off for
-            ``scan_pyarrow_dataset`` consumers. Experimental.
+            ``True`` (encode every dim coordinate) is the DuckDB
+            setting — measured up to ~9x on join-heavy queries;
+            ``"wide"`` encodes only coordinates whose values are wider
+            than the int32 key (8-byte floats/ints/timestamps) — use
+            this for DataFusion, whose streaming aggregates accumulate
+            unmerged per-batch dictionaries on narrow (float32) values
+            until memory blows up; leave ``False`` for Polars
+            (``scan_pyarrow_dataset``), which pays a decode penalty.
+            Experimental.
 
     Returns:
         An :class:`XarrayPushdownDataset`.

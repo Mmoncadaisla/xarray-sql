@@ -57,6 +57,21 @@ def test_dense_dims_stay_dense():
     assert schema.field("lat").type == pa.float64()
 
 
+def test_wide_mode_keeps_narrow_coords_dense():
+    ds = _grid()
+    ds = ds.assign_coords(
+        lat=ds.lat.astype(np.float32), lon=ds.lon.astype(np.float32)
+    )
+    schema = _parse_schema(ds, dict_coords="wide")
+    # timestamp (8-byte) encodes; float32 coords stay dense
+    assert pa.types.is_dictionary(schema.field("time").type)
+    assert schema.field("lat").type == pa.float32()
+    assert schema.field("lon").type == pa.float32()
+    # float64 coords would encode under "wide"
+    schema64 = _parse_schema(_grid(), dict_coords="wide")
+    assert pa.types.is_dictionary(schema64.field("lat").type)
+
+
 def test_dict_indices_cached_and_correct():
     shape = (3, 4, 5)
     a = _dict_indices(shape, 1)

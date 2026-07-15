@@ -160,11 +160,17 @@ class EngineContext:
                 else chunks
             ) or None
             # GEOBENCH_DICT_COORDS=1 registers dictionary-encoded
-            # coordinate columns (never for Polars, which pays a decode
-            # penalty on dictionary ingestion).
-            dict_coords = bool(
+            # coordinate columns. Per-engine policy: never for Polars
+            # (decode penalty); "wide" (8-byte values only) for
+            # DataFusion, whose streaming aggregates accumulate
+            # unmerged float32 dictionaries until the worker OOMs.
+            dict_coords: bool | str = bool(
                 os.environ.get("GEOBENCH_DICT_COORDS")
-            ) and self.engine != "polars"
+            )
+            if dict_coords and self.engine == "polars":
+                dict_coords = False
+            elif dict_coords and self.engine == "datafusion":
+                dict_coords = "wide"
             dataset = xql.arrow_dataset(
                 sub, sub_chunks, dict_coords=dict_coords
             )

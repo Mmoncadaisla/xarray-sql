@@ -539,7 +539,7 @@ def iter_record_batches(
 def _parse_schema(
     ds: xr.Dataset,
     *,
-    dict_coords: bool = False,
+    dict_coords: bool | str = False,
     dense_dims: Iterable[str] = (),
 ) -> pa.Schema:
     """Extracts a `pa.Schema` from the Dataset, treating dims and data_vars as columns.
@@ -566,12 +566,18 @@ def _parse_schema(
     ``DictionaryArray``s over shape-cached indices instead of densely
     repeated values. int32 keys per the overflow analysis on upstream
     PR #217 (engines may concatenate per-batch dictionaries without
-    unifying them, so narrow keys are unsafe). Dims listed in
-    ``dense_dims`` stay dense (e.g. geometry source dims, whose arrays
-    are consumed positionally by the geometry builder).
+    unifying them, so narrow keys are unsafe). ``dict_coords="wide"``
+    encodes only coordinates whose value type is wider than the int32
+    key (8-byte floats/ints/timestamps) — the policy PR #217 converged
+    on for DataFusion, whose streaming aggregates accumulate unmerged
+    per-batch dictionaries (arrow's merge heuristic is not a
+    guarantee); observed as worker OOM on real float32 grids. Dims
+    listed in ``dense_dims`` stay dense (e.g. geometry source dims,
+    whose arrays are consumed positionally by the geometry builder).
     """
     columns = []
     dense = set(dense_dims)
+    wide_only = dict_coords == "wide"
 
     for coord_name, coord_var in ds.coords.items():
         # Only include dimension coordinates
@@ -582,7 +588,14 @@ def _parse_schema(
             else:
                 pa_type = pa.from_numpy_dtype(coord_var.dtype)
                 field = pa.field(coord_name, pa_type)
-            if dict_coords and coord_name not in dense:
+            encode = dict_coords and coord_name not in dense
+            if encode and wide_only:
+                encode = (
+                    field.type.bit_width > 32
+                    if pa.types.is_primitive(field.type)
+                    else True
+                )
+            if encode:
                 field = pa.field(
                     field.name,
                     pa.dictionary(pa.int32(), field.type),
