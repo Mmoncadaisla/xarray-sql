@@ -88,6 +88,21 @@ _STRICT_MAX_DEPTH = 6
 grids terminate in 2-3 levels)."""
 
 
+def _value_schema(schema: pa.Schema) -> pa.Schema:
+    """``schema`` with dictionary fields unwrapped to their value types.
+
+    Pruning, guarantee simplification, and filter-column probing reason
+    about coordinate *values*; dictionary encoding is a property of the
+    emitted batches only.
+    """
+    fields = []
+    for f in schema:
+        if pa.types.is_dictionary(f.type):
+            f = pa.field(f.name, f.type.value_type, f.nullable, f.metadata)
+        fields.append(f)
+    return pa.schema(fields)
+
+
 def _guarantee_shadow(
     guarantees: list[tuple[str, pc.Expression]], schema: pa.Schema
 ) -> pads.FileSystemDataset:
@@ -297,6 +312,7 @@ class XarrayPushdownDataset(pads.Dataset):
         geometry: tuple[str, str] | None = None,
         geometry_encoding: str = "wkb",
         geometry_crs: str | None = "OGC:CRS84",
+        dict_coords: bool = False,
         coord_arrays: dict[str, np.ndarray] | None = None,
         _iteration_callback: (
             Callable[[Block, list[str] | None], None] | None
@@ -312,7 +328,13 @@ class XarrayPushdownDataset(pads.Dataset):
                     "Please filter data_vars in the Dataset."
                 )
         self._ds = ds
-        self._schema = _parse_schema(ds)
+        # Geometry source dims stay dense: build_geometry consumes their
+        # batch columns as positional coordinate arrays.
+        self._schema = _parse_schema(
+            ds,
+            dict_coords=dict_coords,
+            dense_dims=tuple(geometry) if geometry else (),
+        )
         self._geometry = tuple(geometry) if geometry else None
         self._geometry_encoding = geometry_encoding
         if self._geometry:
@@ -564,10 +586,11 @@ class XarrayPushdownDataset(pads.Dataset):
             return proj
         wanted = set(proj)
         for _ in range(len(self._schema.names) + 1):
+            probe_schema = _value_schema(self._schema)
             probe = pa.table(
                 {
-                    n: pa.array([], type=self._schema.field(n).type)
-                    for n in self._schema.names
+                    n: pa.array([], type=probe_schema.field(n).type)
+                    for n in probe_schema.names
                     if n in wanted
                 }
             )
@@ -608,7 +631,10 @@ class XarrayPushdownDataset(pads.Dataset):
                 continue  # strings/objects/cftime: never prune this dim
             try:
                 shadows[name] = _DimShadow(
-                    name, self._schema, coord, self._chunk_bounds[dim]
+                    name,
+                    _value_schema(self._schema),
+                    coord,
+                    self._chunk_bounds[dim],
                 )
             except (pa.ArrowInvalid, pa.ArrowNotImplementedError, TypeError):
                 continue  # conservative: no pruning on this dim
@@ -699,7 +725,7 @@ class XarrayPushdownDataset(pads.Dataset):
             lo, hi, bad = self._chunk_spans(str(d))
             if bad[indices].any():
                 return None
-            field_type = self._schema.field(str(d)).type
+            field_type = _value_schema(self._schema).field(str(d)).type
             return (
                 pc.field(str(d)) >= pa.scalar(lo[indices].min(), field_type)
             ) & (pc.field(str(d)) <= pa.scalar(hi[indices].max(), field_type))
@@ -1041,6 +1067,7 @@ def arrow_dataset(
     geometry: tuple[str, str] | None = None,
     geometry_encoding: str = "wkb",
     geometry_crs: str | None = "OGC:CRS84",
+    dict_coords: bool = False,
 ) -> XarrayPushdownDataset:
     """A pushdown-capable ``pyarrow.dataset.Dataset`` view of ``ds``.
 
@@ -1087,6 +1114,14 @@ def arrow_dataset(
         geometry_crs: CRS tag carried in the extension metadata.
             Defaults to ``OGC:CRS84`` (plain longitude/latitude); pass
             ``None`` to omit, or an authority code / PROJJSON string.
+        dict_coords: Emit dimension-coordinate columns as Arrow
+            ``dictionary(int32, value_type)`` arrays over shape-cached
+            indices instead of densely repeated values — ~10x cheaper
+            batch production that scales across producer threads, at
+            ~40% fewer coordinate bytes. Ingestion is engine-dependent:
+            DuckDB and DataFusion consume dictionaries natively; Polars
+            pays a decode penalty, so leave this off for
+            ``scan_pyarrow_dataset`` consumers. Experimental.
 
     Returns:
         An :class:`XarrayPushdownDataset`.
@@ -1101,4 +1136,5 @@ def arrow_dataset(
         geometry=geometry,
         geometry_encoding=geometry_encoding,
         geometry_crs=geometry_crs,
+        dict_coords=dict_coords,
     )

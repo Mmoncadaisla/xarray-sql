@@ -1,4 +1,6 @@
 import itertools
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
 from typing import Any
 
@@ -309,6 +311,63 @@ DEFAULT_BATCH_SIZE: int = 65_536
 _FULL_PIVOT_MAX_ROWS: int = 8_388_608
 
 
+#: Byte cap for cached dictionary index arrays. Indices depend only on
+#: (partition shape, dim position), so all same-shaped partitions of a
+#: dataset share one entry; the cap only matters when many differently
+#: shaped datasets are registered in one process.
+_DICT_INDEX_CACHE_MAX_BYTES: int = 256 * 1024 * 1024
+
+_dict_index_cache: "OrderedDict[tuple, pa.Array]" = OrderedDict()
+_dict_index_cache_bytes: int = 0
+_dict_index_lock = threading.Lock()
+
+
+def _dict_indices(shape: tuple[int, ...], k: int) -> pa.Array:
+    """Full-partition dictionary indices for dim ``k`` of ``shape``.
+
+    In C order, dim k's flat index column is ``arange(shape[k])`` with
+    each value repeated ``prod(shape[k+1:])`` times and that pattern
+    tiled ``prod(shape[:k])`` times. It depends only on the shape, never
+    on coordinate values, so it is cached and shared zero-copy across
+    every same-shaped partition — the pivot's per-partition coordinate
+    cost collapses to wrapping the raw 1-D coordinate as a dictionary.
+    """
+    global _dict_index_cache_bytes
+    key = (shape, k)
+    with _dict_index_lock:
+        cached = _dict_index_cache.get(key)
+        if cached is not None:
+            _dict_index_cache.move_to_end(key)
+            return cached
+    stride = int(np.prod(shape[k + 1 :]))
+    outer = int(np.prod(shape[:k]))
+    idx = np.repeat(np.arange(shape[k], dtype=np.int32), stride)
+    if outer > 1:
+        idx = np.tile(idx, outer)
+    arr = pa.array(idx)
+    with _dict_index_lock:
+        _dict_index_cache[key] = arr
+        _dict_index_cache_bytes += arr.nbytes
+        while _dict_index_cache_bytes > _DICT_INDEX_CACHE_MAX_BYTES and (
+            len(_dict_index_cache) > 1
+        ):
+            _, evicted = _dict_index_cache.popitem(last=False)
+            _dict_index_cache_bytes -= evicted.nbytes
+    return arr
+
+
+def _value_field(field: pa.Field) -> pa.Field:
+    """The field with a dictionary type unwrapped to its value type."""
+    if pa.types.is_dictionary(field.type):
+        return pa.field(
+            field.name,
+            field.type.value_type,
+            field.nullable,
+            field.metadata,
+        )
+    return field
+
+
 def _as_single_array(values, type: pa.DataType, *, from_pandas: bool = False):
     """``pa.array`` that always returns a contiguous ``pa.Array``.
 
@@ -372,7 +431,9 @@ def iter_record_batches(
             continue
         vals = ds.coords[name].values
         if cft.is_cftime(vals):
-            coord_values[name] = cft.convert_for_field(vals, schema.field(name))
+            coord_values[name] = cft.convert_for_field(
+                vals, _value_field(schema.field(name))
+            )
         else:
             coord_values[name] = vals
 
@@ -403,6 +464,19 @@ def iter_record_batches(
             name = field.name
             if name in ds.coords and name in ds.dims:
                 k = dim_names.index(name)
+                if pa.types.is_dictionary(field.type):
+                    # Shape-cached indices + the raw 1-D coordinate as
+                    # the dictionary: no dense expansion at all, and
+                    # batch slices share both buffers zero-copy.
+                    full_arrays.append(
+                        pa.DictionaryArray.from_arrays(
+                            _dict_indices(shape, k),
+                            _as_single_array(
+                                coord_values[name], field.type.value_type
+                            ),
+                        )
+                    )
+                    continue
                 outer = int(np.prod(shape[:k]))
                 col = np.repeat(coord_values[name], strides[k])
                 if outer > 1:
@@ -431,6 +505,16 @@ def iter_record_batches(
             if name in ds.coords and name in ds.dims:
                 k = dim_names.index(name)
                 coord_idx = (row_idx // strides[k]) % shape[k]
+                if pa.types.is_dictionary(field.type):
+                    arrays.append(
+                        pa.DictionaryArray.from_arrays(
+                            pa.array(coord_idx.astype(np.int32)),
+                            _as_single_array(
+                                coord_values[name], field.type.value_type
+                            ),
+                        )
+                    )
+                    continue
                 arrays.append(
                     _as_single_array(coord_values[name][coord_idx], field.type)
                 )
@@ -446,7 +530,12 @@ def iter_record_batches(
         yield pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
-def _parse_schema(ds: xr.Dataset) -> pa.Schema:
+def _parse_schema(
+    ds: xr.Dataset,
+    *,
+    dict_coords: bool = False,
+    dense_dims: Iterable[str] = (),
+) -> pa.Schema:
     """Extracts a `pa.Schema` from the Dataset, treating dims and data_vars as columns.
 
     Only *dimension coordinates* become dimension columns, so a dimension
@@ -465,18 +554,36 @@ def _parse_schema(ds: xr.Dataset) -> pa.Schema:
     * **Non-Gregorian calendars** (360_day, julian):
       ``pa.int64()`` with ``xarray:units`` / ``xarray:calendar`` metadata
       on the field, preserving lossless CF-convention encoding.
+
+    With ``dict_coords=True``, dimension-coordinate fields are typed as
+    ``dictionary(int32, value_type)`` and the batch builders emit
+    ``DictionaryArray``s over shape-cached indices instead of densely
+    repeated values. int32 keys per the overflow analysis on upstream
+    PR #217 (engines may concatenate per-batch dictionaries without
+    unifying them, so narrow keys are unsafe). Dims listed in
+    ``dense_dims`` stay dense (e.g. geometry source dims, whose arrays
+    are consumed positionally by the geometry builder).
     """
     columns = []
+    dense = set(dense_dims)
 
     for coord_name, coord_var in ds.coords.items():
         # Only include dimension coordinates
         if coord_name in ds.dims:
             if cft.is_cftime_index(ds, coord_name):
                 units, calendar = cft.encoding(ds, coord_name)
-                columns.append(cft.arrow_field(coord_name, units, calendar))
+                field = cft.arrow_field(coord_name, units, calendar)
             else:
                 pa_type = pa.from_numpy_dtype(coord_var.dtype)
-                columns.append(pa.field(coord_name, pa_type))
+                field = pa.field(coord_name, pa_type)
+            if dict_coords and coord_name not in dense:
+                field = pa.field(
+                    field.name,
+                    pa.dictionary(pa.int32(), field.type),
+                    field.nullable,
+                    field.metadata,
+                )
+            columns.append(field)
 
     for var_name, var in ds.data_vars.items():
         # Data variables are virtually never cftime, but check dtype as a
