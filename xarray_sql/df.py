@@ -468,12 +468,16 @@ def iter_record_batches(
                     # Shape-cached indices + the raw 1-D coordinate as
                     # the dictionary: no dense expansion at all, and
                     # batch slices share both buffers zero-copy.
+                    # safe=False skips index validation — indices are
+                    # arange(shape[k]) repeats, in-range by construction,
+                    # and validating 10^6+ of them costs ~1 ms/partition.
                     full_arrays.append(
                         pa.DictionaryArray.from_arrays(
                             _dict_indices(shape, k),
                             _as_single_array(
                                 coord_values[name], field.type.value_type
                             ),
+                            safe=False,
                         )
                     )
                     continue
@@ -506,12 +510,14 @@ def iter_record_batches(
                 k = dim_names.index(name)
                 coord_idx = (row_idx // strides[k]) % shape[k]
                 if pa.types.is_dictionary(field.type):
+                    # In-range by construction (modulo shape[k]).
                     arrays.append(
                         pa.DictionaryArray.from_arrays(
                             pa.array(coord_idx.astype(np.int32)),
                             _as_single_array(
                                 coord_values[name], field.type.value_type
                             ),
+                            safe=False,
                         )
                     )
                     continue
