@@ -106,9 +106,16 @@ def run_case_cell(
     reps: int,
     src_targz: bytes | None = None,
     rep_timeout: float = 600.0,
+    dict_coords: bool = False,
 ) -> dict:
     """One (case, engine) cell: ``reps`` fresh-process cold runs."""
-    result = {"case": case, "engine": engine, "status": "ok", "reps": []}
+    result = {
+        "case": case,
+        "engine": engine,
+        "dict_coords": dict_coords,
+        "status": "ok",
+        "reps": [],
+    }
     try:
         src_root, geo_dir = _install_src(src_targz)
         env = dict(
@@ -120,6 +127,8 @@ def run_case_cell(
             PYTHONUNBUFFERED="1",
             PYTHONPATH=src_root,
         )
+        if dict_coords:
+            env["GEOBENCH_DICT_COORDS"] = "1"
         rows: list[dict] = []
         for rep in range(1, reps + 1):
             with tempfile.NamedTemporaryFile(suffix=".csv") as csv_file:
@@ -284,12 +293,14 @@ def _drive_vm(vm, cells, args, src, results, jsonl_lock):
         return
     log(vm, f"machine: {json.dumps(meta['machine'])}")
     total = len(cells)
-    for k, (case, engine) in enumerate(cells, 1):
-        tag = f"cell {k}/{total} {case} x {engine}"
+    for k, (case, engine, dcoords) in enumerate(cells, 1):
+        mode = " +dict" if dcoords else ""
+        tag = f"cell {k}/{total} {case} x {engine}{mode}"
         if case in NOT_PORTABLE and engine != "datafusion":
             rec = {
                 "case": case,
                 "engine": engine,
+                "dict_coords": dcoords,
                 "status": "n/a",
                 "reason": NOT_PORTABLE[case],
             }
@@ -298,14 +309,19 @@ def _drive_vm(vm, cells, args, src, results, jsonl_lock):
             t0 = time.monotonic()
             try:
                 if submit is None:
-                    rec = run_case_cell(case, engine, args.reps, src)
+                    rec = run_case_cell(
+                        case, engine, args.reps, src, dict_coords=dcoords
+                    )
                 else:
-                    fut = submit(case, engine, args.reps, src)
+                    fut = submit(
+                        case, engine, args.reps, src, dict_coords=dcoords
+                    )
                     rec = fut.result(timeout=args.cell_timeout)
             except Exception as exc:  # noqa: BLE001
                 rec = {
                     "case": case,
                     "engine": engine,
+                    "dict_coords": dcoords,
                     "status": "error",
                     "error": f"{type(exc).__name__}: {exc}"[:500],
                 }
@@ -401,6 +417,13 @@ def main() -> None:
     ap.add_argument("--engines", default=",".join(ENGINES))
     ap.add_argument("--vms", default=",".join(VM_SIZES))
     ap.add_argument("--cell-timeout", type=float, default=1800.0)
+    ap.add_argument(
+        "--dict-modes",
+        default="off",
+        choices=["off", "on", "both"],
+        help="run cells dense, dictionary-encoded, or both "
+        "(Polars always runs dense)",
+    )
     ap.add_argument("--out", default="engine_suite_results.json")
     ap.add_argument("--jsonl", default="engine_suite_results.jsonl")
     args = ap.parse_args()
@@ -408,15 +431,24 @@ def main() -> None:
     cases = [c for c in args.cases.split(",") if c]
     engines = [e for e in args.engines.split(",") if e]
     vms = ["local"] if args.local else [v for v in args.vms.split(",") if v]
-    cells = [(c, e) for c in cases for e in engines]
+    modes = {"off": [False], "on": [True], "both": [False, True]}[
+        args.dict_modes
+    ]
+    cells = [
+        (c, e, m)
+        for c in cases
+        for e in engines
+        for m in modes
+        if not (m and e == "polars")
+    ]
     log("plan", f"{len(vms)} VMs x {len(cells)} cells, reps={args.reps}")
-    for c, e in cells:
+    for c, e, m in cells:
         note = (
             f"  [{NOT_PORTABLE[c]}]"
             if c in NOT_PORTABLE and e != "datafusion"
             else ""
         )
-        log("plan", f"  {c} x {e}{note}")
+        log("plan", f"  {c} x {e}{' +dict' if m else ''}{note}")
     src = _pack_src()
     log("plan", f"packed source: {len(src) / 1024:.0f} KiB")
 

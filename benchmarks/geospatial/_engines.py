@@ -159,7 +159,17 @@ class EngineContext:
                 if isinstance(chunks, dict)
                 else chunks
             ) or None
-            dataset = xql.arrow_dataset(sub, sub_chunks)
+            # GEOBENCH_DICT_COORDS=1 registers dictionary-encoded
+            # coordinate columns (never for Polars, which pays a decode
+            # penalty on dictionary ingestion).
+            dict_coords = bool(
+                os.environ.get("GEOBENCH_DICT_COORDS")
+            ) and self.engine != "polars"
+            dataset = xql.arrow_dataset(
+                sub, sub_chunks, dict_coords=dict_coords
+            )
+            if dict_coords and "dict-coords" not in self.flavor:
+                self.flavor += " + dict-coords"
             if self.engine == "duckdb":
                 self._con.register(flat, dataset)
             elif self.engine == "polars":
