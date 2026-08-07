@@ -1,4 +1,5 @@
 import itertools
+from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
 from typing import Any
 
@@ -129,6 +130,23 @@ def block_slices(ds: xr.Dataset, chunks: Chunks = None) -> Iterator[Block]:
 def explode(ds: xr.Dataset, chunks: Chunks = None) -> Iterator[xr.Dataset]:
     """Explodes a dataset into its chunks."""
     yield from (ds.isel(b) for b in block_slices(ds, chunks=chunks))
+
+
+def group_vars_by_dims(ds: xr.Dataset) -> dict[tuple[str, ...], list[str]]:
+    """Group a Dataset's data variables by their exact dimension tuple.
+
+    Variables that share dimensions can share a table; each distinct
+    dimension tuple becomes its own table when a mixed-dimension Dataset
+    is registered::
+
+        ("time", "lat", "lon"):          ["temperature_2m", "wind_speed"],
+        ("time", "lat", "lon", "level"): ["pressure", "humidity"]
+    """
+    groups = defaultdict(list)
+    for var_name, var in ds.data_vars.items():
+        dims = var.dims
+        groups[dims].append(var_name)
+    return groups
 
 
 def _block_len(block: Block) -> int:
@@ -293,9 +311,39 @@ def dataset_to_record_batch(
     return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
-#: Default number of rows per emitted Arrow RecordBatch.
-#: 64 K rows balances DataFusion pipeline depth against per-batch overhead.
 DEFAULT_BATCH_SIZE: int = 65_536
+"""Default number of rows per emitted Arrow RecordBatch.
+
+64 K rows balances DataFusion pipeline depth against per-batch overhead.
+"""
+
+_FULL_PIVOT_MAX_ROWS: int = 8_388_608
+"""Row cap for the whole-partition coordinate fast path in
+iter_record_batches.
+
+Below this, coordinate columns are materialised for the full partition
+with repeat/tile (sequential writes, ~3x faster than per-batch index
+arithmetic) and batches are zero-copy slices; the cost is holding every
+coordinate column of the partition in memory at once (rows x 8 bytes x
+n_dims). Above it — e.g. single-time-step reanalysis partitions with
+tens of millions of rows — the per-batch path keeps peak memory at
+O(batch_size) per coordinate instead.
+"""
+
+
+def _as_single_array(values, type: pa.DataType, *, from_pandas: bool = False):
+    """``pa.array`` that always returns a contiguous ``pa.Array``.
+
+    ``pa.array`` may return a ``ChunkedArray`` instead of an ``Array`` for
+    large inputs (observed for numpy fixed-width unicode columns of a few
+    million rows — e.g. a string dimension coordinate tiled across a full
+    partition). ``RecordBatch.from_arrays`` rejects chunked input, so
+    flatten it back to one contiguous array.
+    """
+    arr = pa.array(values, type=type, from_pandas=from_pandas)
+    if isinstance(arr, pa.ChunkedArray):
+        arr = arr.combine_chunks()
+    return arr
 
 
 def iter_record_batches(
@@ -338,8 +386,17 @@ def iter_record_batches(
 
     # Preload small 1-D coordinate arrays (negligible memory).
     # Convert cftime objects to numeric values matching the schema type.
+    # Projected scans may omit dimension columns from the schema; those
+    # dims still shape the iteration but never emit a column.
     coord_values = {}
+    schema_names = set(schema.names)
     for name in dim_names:
+        # A dim the projection dropped (e.g. time under GROUP BY level) is never
+        # read in the batch loop below, which only iterates the schema's fields.
+        # Skip it so schema.field(name) is not called for a projected-away name
+        # (it raises for cftime coords, which take the convert_for_field path).
+        if name not in schema_names:
+            continue
         vals = ds.coords[name].values
         if cft.is_cftime(vals):
             coord_values[name] = cft.convert_for_field(vals, schema.field(name))
@@ -361,6 +418,36 @@ def iter_record_batches(
             else:
                 data_arrays[field.name] = raw.ravel()
 
+    if 0 < total_rows <= _FULL_PIVOT_MAX_ROWS:
+        # Fast path: build each coordinate column once for the whole
+        # partition. In C order, dim k's flat column is its coord values
+        # each repeated prod(shape[k+1:]) times, with that pattern tiled
+        # prod(shape[:k]) times — two sequential-write kernels, much
+        # faster than per-batch division/modulo plus gather. Batches are
+        # then zero-copy slices of the full-partition Arrow arrays.
+        full_arrays = []
+        for field in schema:
+            name = field.name
+            if name in ds.coords and name in ds.dims:
+                k = dim_names.index(name)
+                outer = int(np.prod(shape[:k]))
+                col = np.repeat(coord_values[name], strides[k])
+                if outer > 1:
+                    col = np.tile(col, outer)
+                full_arrays.append(_as_single_array(col, field.type))
+            else:
+                full_arrays.append(
+                    _as_single_array(
+                        data_arrays[name], field.type, from_pandas=True
+                    )
+                )
+        for row_start in range(0, total_rows, batch_size):
+            yield pa.RecordBatch.from_arrays(
+                [a.slice(row_start, batch_size) for a in full_arrays],
+                schema=schema,
+            )
+        return
+
     for row_start in range(0, total_rows, batch_size):
         row_end = min(row_start + batch_size, total_rows)
         row_idx = np.arange(row_start, row_end)
@@ -372,13 +459,13 @@ def iter_record_batches(
                 k = dim_names.index(name)
                 coord_idx = (row_idx // strides[k]) % shape[k]
                 arrays.append(
-                    pa.array(coord_values[name][coord_idx], type=field.type)
+                    _as_single_array(coord_values[name][coord_idx], field.type)
                 )
             else:
                 arrays.append(
-                    pa.array(
+                    _as_single_array(
                         data_arrays[name][row_start:row_end],
-                        type=field.type,
+                        field.type,
                         from_pandas=True,
                     )
                 )
@@ -386,12 +473,26 @@ def iter_record_batches(
         yield pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
+def _arrow_type_for_object(values: np.ndarray) -> pa.DataType:
+    """Infer an Arrow type for a non-cftime object-dtype array.
+
+    ``pa.from_numpy_dtype`` cannot map numpy object dtype, so let pyarrow infer
+    the type from the data instead: strings become ``pa.string()``, bytes
+    ``pa.binary()``, and other representable Python scalars their Arrow
+    equivalent. An all-null array stays ``pa.null()``, and a column mixing
+    incompatible types (e.g. str and int) raises, surfacing a clear error
+    rather than a silent coercion. Object-dtype arrays are never Dask/Zarr
+    backed, so this triggers no remote I/O.
+    """
+    return pa.array(np.asarray(values).ravel()).type
+
+
 def _parse_schema(ds: xr.Dataset) -> pa.Schema:
     """Extracts a `pa.Schema` from the Dataset, treating dims and data_vars as columns.
 
     Only *dimension coordinates* become dimension columns, so a dimension
     without a coordinate would be dropped. Callers must run the Dataset through
-    :func:`_ensure_default_indexes` first (the readers do) so every dimension
+    ``_ensure_default_indexes`` first (the readers do) so every dimension
     has a coordinate and appears as a column.
 
     Uses the xarray index type to detect cftime coordinates without
@@ -414,19 +515,29 @@ def _parse_schema(ds: xr.Dataset) -> pa.Schema:
             if cft.is_cftime_index(ds, coord_name):
                 units, calendar = cft.encoding(ds, coord_name)
                 columns.append(cft.arrow_field(coord_name, units, calendar))
+            elif coord_var.dtype == np.dtype("O"):
+                # Object dtype that isn't cftime (e.g. string station names).
+                arrow_type = _arrow_type_for_object(coord_var.values)
+                columns.append(pa.field(coord_name, arrow_type))
             else:
                 pa_type = pa.from_numpy_dtype(coord_var.dtype)
                 columns.append(pa.field(coord_name, pa_type))
 
     for var_name, var in ds.data_vars.items():
-        # Data variables are virtually never cftime, but check dtype as a
-        # cheap guard.  Only fall back to _is_cftime (which materializes
-        # element 0) when dtype is object.
-        if var.dtype == np.dtype("O") and cft.is_cftime(var.values):
-            # Rare: a data variable holding cftime objects.  Use same encoding
-            # as the first cftime dimension coordinate, or default.
-            cal = var.values.ravel()[0].calendar
-            columns.append(cft.arrow_field(var_name, cft.DEFAULT_UNITS, cal))
+        # An object-dtype data variable may hold cftime objects (encode it like
+        # a cftime coordinate) or strings/other Python scalars (infer the Arrow
+        # type from the data). The dtype check keeps the common numeric path off
+        # the object branch.
+        if var.dtype == np.dtype("O"):
+            if cft.is_cftime(var.values):
+                # Encode with the same units/calendar as a cftime coordinate.
+                cal = var.values.ravel()[0].calendar
+                columns.append(
+                    cft.arrow_field(var_name, cft.DEFAULT_UNITS, cal)
+                )
+            else:
+                arrow_type = _arrow_type_for_object(var.values)
+                columns.append(pa.field(var_name, arrow_type))
         else:
             pa_type = pa.from_numpy_dtype(var.dtype)
             columns.append(pa.field(var_name, pa_type))
@@ -466,14 +577,19 @@ def _block_metadata(
         coord_values = coord_arrays[str(dim)][slc]
         if len(coord_values) == 0:
             continue
+        # cftime coordinates are object dtype but carry their own bound
+        # encoding, so they must be handled before the string/object skip
+        # below (otherwise pruning is silently disabled for them).
+        # partition_bounds returns None when the bound overflows int64.
+        if cft.is_cftime(coord_values):
+            bounds = cft.partition_bounds(coord_values)
+            if bounds is not None:
+                ranges[str(dim)] = bounds
+            continue
         # String/object dtypes are not representable as ScalarBound
         # (Int64/Float64/TimestampNanos) and numpy min/max ufuncs do not
         # support them.  Skip so pruning treats the dimension conservatively.
         if coord_values.dtype.kind in ("U", "S", "O"):
-            continue
-
-        if cft.is_cftime(coord_values):
-            ranges[str(dim)] = cft.partition_bounds(coord_values)
             continue
 
         # Use actual min/max rather than first/last so that non-monotonic
@@ -483,9 +599,18 @@ def _block_metadata(
         max_val = coord_values.max()
 
         if isinstance(min_val, (np.datetime64, pd.Timestamp)):
-            min_val = int(pd.Timestamp(min_val).value)
-            max_val = int(pd.Timestamp(max_val).value)
-            ranges[str(dim)] = (min_val, max_val, "timestamp_ns")
+            # The Rust pruning layer only accepts int64 nanosecond bounds
+            # (ScalarBound::TimestampNanos).  Dates outside the
+            # datetime64[ns] range (pre-1678 / post-2262) cannot be
+            # represented, so skip pruning for this dimension rather than
+            # raising -- registration still succeeds and the Rust pruner
+            # treats a missing dimension conservatively (never prunes on it).
+            try:
+                min_ns = int(pd.Timestamp(min_val).value)
+                max_ns = int(pd.Timestamp(max_val).value)
+            except (OverflowError, pd.errors.OutOfBoundsDatetime):
+                continue
+            ranges[str(dim)] = (min_ns, max_ns, "timestamp_ns")
         elif hasattr(min_val, "item"):
             min_val = min_val.item()
             max_val = max_val.item()

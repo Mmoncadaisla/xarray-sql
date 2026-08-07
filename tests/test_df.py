@@ -8,6 +8,7 @@ import xarray as xr
 
 from xarray_sql.df import (
     DEFAULT_BATCH_SIZE,
+    _ensure_default_indexes,
     _parse_schema,
     block_slices,
     compute_chunks,
@@ -15,7 +16,9 @@ from xarray_sql.df import (
     explode,
     from_map,
     from_map_batched,
+    group_vars_by_dims,
     iter_record_batches,
+    partition_metadata,
     pivot,
 )
 from xarray_sql.reader import read_xarray, read_xarray_table
@@ -177,6 +180,30 @@ def test_iter_record_batches_matches_dataset_to_record_batch(air_small):
         .reset_index(drop=True)
     )
     pd.testing.assert_frame_equal(actual_df, expected_df)
+
+
+def test_iter_record_batches_projection_drops_cftime_dim():
+    """A projection that drops a cftime dim (e.g. time under GROUP BY level)
+    must not call schema.field() for it. The dim is absent from the projected
+    schema, and cftime coords take the convert_for_field(schema.field(name))
+    path, so an unguarded lookup raised KeyError during batch reading."""
+    cftime = pytest.importorskip("cftime")
+    times = np.array(
+        [cftime.DatetimeGregorian(2020, m, 1) for m in (1, 2, 3)], dtype=object
+    )
+    ds = xr.Dataset(
+        {"air": (["time", "lat"], np.arange(3 * 2, dtype=float).reshape(3, 2))},
+        coords={"time": times, "lat": [0.0, 1.0]},
+    )
+    full = _parse_schema(ds)
+    projected = pa.schema(
+        [full.field("lat"), full.field("air")]
+    )  # time dropped
+    table = pa.Table.from_batches(
+        list(iter_record_batches(ds, projected, batch_size=16)), projected
+    )
+    assert table.schema.names == ["lat", "air"]
+    assert table.num_rows == 6
 
 
 def test_iter_record_batches_default_batch_size():
@@ -403,20 +430,22 @@ def test_read_xarray_loads_one_chunk_at_a_time(large_ds):
             peaks.append(cur_peak)
 
         for size in sizes:
-            # Observed range: 1.59–1.83× on macOS, up to ~2.7× on Linux
-            # (glibc + Arrow allocate more intermediate buffers).
-            # iter_record_batches holds data-variable arrays (≈1× chunk) while
-            # yielding sub-batches, plus the current Arrow batch (≈0.65× chunk).
+            # iter_record_batches' whole-partition fast path holds the
+            # data-variable arrays (≈1× chunk) plus repeat/tile-expanded
+            # coordinate columns (n_dims × 8 bytes × rows, ≈1.5× chunk
+            # for this 3-dim float64 dataset) for the partition being
+            # streamed; batches themselves are zero-copy slices.
             assert chunk_size * 1.3 < size, f"size {size} unexpectedly low"
-            assert chunk_size * 3.5 > size, f"size {size} unexpectedly high"
+            assert chunk_size * 4.0 > size, f"size {size} unexpectedly high"
 
         for peak in peaks:
-            # Observed range: 1.84–3.28× on macOS, up to ~4.15× on Linux
-            # (glibc + Arrow hold more intermediate buffers at peak).
-            # Peak includes data arrays + Arrow batch + temporary coordinate index
-            # arrays; the first batch of each chunk is highest (Dask compute overhead).
+            # Peak adds transient buffers on top of the steady state:
+            # np.repeat/np.tile intermediates for the coordinate columns
+            # and Arrow's from_pandas null scan; the first batch of each
+            # chunk is highest (Dask compute overhead). Observed ~5.04×
+            # on macOS.
             assert chunk_size * 1.5 < peak, f"peak {peak} unexpectedly low"
-            assert chunk_size * 5.0 > peak, f"peak {peak} unexpectedly high"
+            assert chunk_size * 6.5 > peak, f"peak {peak} unexpectedly high"
 
         assert max(peaks) < large_ds.nbytes
     finally:
@@ -532,3 +561,209 @@ def test_compute_chunks_tuples_sum_to_dim_size():
     result = compute_chunks(ds, {"a": 3, "b": 4, "c": 5})
     for dim, tup in result.items():
         assert sum(tup) == ds.sizes[dim]
+
+
+def test_iter_record_batches_large_string_dim_coord():
+    """A string dim coord big enough that pa.array returns a ChunkedArray.
+
+    Pivoting tiles a string dimension coordinate across every row of the
+    partition; for a few million rows pyarrow's numpy-unicode conversion
+    returns a ChunkedArray, which RecordBatch.from_arrays rejects.
+    Regression: found by the forecast-skill benchmark (a 2-model x 3.3M-row
+    window) streaming through the pyarrow dataset protocol into DuckDB.
+    """
+    n_x = 1_700_000  # 2 * n_x rows: comfortably past the chunking threshold
+    ds = xr.Dataset(
+        {"value": (("model", "x"), np.zeros((2, n_x), dtype="float32"))},
+        coords={"model": ["pangu", "graphcast"], "x": np.arange(n_x)},
+    )
+    schema = _parse_schema(ds)
+    got_rows = 0
+    for batch in iter_record_batches(ds, schema, batch_size=DEFAULT_BATCH_SIZE):
+        got_rows += batch.num_rows
+    assert got_rows == 2 * n_x
+
+
+# -- Object-dtype and out-of-ns-range coordinate support --------------------
+
+
+def _field_type(schema, name):
+    return schema.field(name).type
+
+
+def test_parse_schema_maps_object_string_data_var_to_string():
+    # A string variable arrives as numpy object dtype; _parse_schema must not
+    # hand it to pa.from_numpy_dtype (which raises "Unsupported numpy type 17").
+    ds = xr.Dataset(
+        {"label": (["x"], np.array(["a", "b"], dtype=object))},
+        coords={"x": [1, 2]},
+    )
+    schema = _parse_schema(_ensure_default_indexes(ds))
+    assert _field_type(schema, "label") == pa.string()
+
+
+def test_parse_schema_maps_object_string_coord_to_string():
+    # A string dimension coordinate (e.g. station names) is object dtype too.
+    ds = xr.Dataset(
+        {"v": (["station"], [1.0, 2.0])},
+        coords={"station": np.array(["A", "B"], dtype=object)},
+    )
+    schema = _parse_schema(_ensure_default_indexes(ds))
+    assert _field_type(schema, "station") == pa.string()
+
+
+def test_partition_metadata_skips_out_of_ns_datetime():
+    # datetime64 coordinates outside the datetime64[ns] range (pre-1678 /
+    # post-2262) cannot be represented as int64 nanoseconds, so partition
+    # pruning must be skipped for that dimension rather than raising
+    # OverflowError. Registration must still succeed.
+    times = xr.date_range(
+        "0001-01-01", periods=3, freq="100YS", use_cftime=True
+    ).to_datetimeindex(time_unit="us", unsafe=True)
+    ds = _ensure_default_indexes(
+        xr.Dataset({"v": (["time"], np.arange(3.0))}, coords={"time": times})
+    )
+    blocks = list(block_slices(ds, chunks={"time": 2}))
+
+    meta = partition_metadata(ds, blocks)  # must not raise
+
+    assert len(meta) == len(blocks)
+    # "time" is unpruneable here, so it is omitted from every partition.
+    assert all("time" not in m for m in meta)
+
+
+def test_parse_schema_all_null_object_var_stays_null():
+    # An all-null object column has no data to infer a type from; let null be
+    # null rather than coercing it to a string column.
+    ds = _ensure_default_indexes(
+        xr.Dataset(
+            {"label": (["x"], np.array([None, None], dtype=object))},
+            coords={"x": [1, 2]},
+        )
+    )
+    schema = _parse_schema(ds)
+    assert pa.types.is_null(schema.field("label").type)
+
+
+def test_partition_metadata_prunes_cftime_coord():
+    # cftime dimension coordinates must produce pruning bounds; previously the
+    # object-dtype skip shadowed the cftime branch, silently disabling pruning.
+    times = xr.date_range(
+        "2000-01-01", periods=4, freq="1D", calendar="noleap", use_cftime=True
+    )
+    ds = _ensure_default_indexes(
+        xr.Dataset({"v": (["time"], np.arange(4.0))}, coords={"time": times})
+    )
+    blocks = list(block_slices(ds, chunks={"time": 2}))
+
+    meta = partition_metadata(ds, blocks)
+
+    assert all("time" in m for m in meta)
+    for m in meta:
+        _, _, tag = m["time"]
+        assert tag == "timestamp_ns"
+
+
+def test_partition_metadata_skips_ancient_cftime():
+    # Ancient gregorian cftime dates overflow the int64 nanosecond range, so
+    # pruning must be skipped for that dim (no raise, dim omitted).
+    times = xr.date_range(
+        "0001-01-01", periods=3, freq="100YS", use_cftime=True
+    )
+    ds = _ensure_default_indexes(
+        xr.Dataset({"v": (["time"], np.arange(3.0))}, coords={"time": times})
+    )
+    blocks = list(block_slices(ds, chunks={"time": 2}))
+
+    meta = partition_metadata(ds, blocks)  # must not raise
+
+    assert all("time" not in m for m in meta)
+
+
+def test_string_dataset_round_trips_through_record_batch():
+    # The schema fix must also flow through the batch builders: a string
+    # column has to materialize as an Arrow string array, not error out.
+    ds = _ensure_default_indexes(
+        xr.Dataset(
+            {"label": (["x"], np.array(["a", "b", "c", "d"], dtype=object))},
+            coords={"x": [10, 20, 30, 40]},
+        )
+    )
+    schema = _parse_schema(ds)
+
+    batch = dataset_to_record_batch(ds, schema)
+    assert batch.schema.field("label").type == pa.string()
+    assert batch.column("label").to_pylist() == ["a", "b", "c", "d"]
+
+    # The streaming path must agree with the one-shot path.
+    streamed = pa.Table.from_batches(
+        list(iter_record_batches(ds, schema, batch_size=2)), schema=schema
+    )
+    assert streamed.column("label").to_pylist() == ["a", "b", "c", "d"]
+
+
+def test_partition_metadata_in_range_datetime_still_pruned():
+    # Regression guard: ordinary datetimes must keep producing timestamp_ns
+    # bounds so filter pushdown still works after the overflow fix.
+    times = pd.date_range("2000-01-01", periods=4, freq="D")
+    ds = _ensure_default_indexes(
+        xr.Dataset({"v": (["time"], np.arange(4.0))}, coords={"time": times})
+    )
+    blocks = list(block_slices(ds, chunks={"time": 2}))
+
+    meta = partition_metadata(ds, blocks)
+
+    assert all("time" in m for m in meta)
+    for m in meta:
+        _, _, tag = m["time"]
+        assert tag == "timestamp_ns"
+
+
+class TestGroupVarsByDims:
+    def test_single_dim_group(self):
+        ds = xr.Dataset(
+            {
+                "a": (["x", "y"], np.zeros((2, 3))),
+                "b": (["x", "y"], np.ones((2, 3))),
+            }
+        )
+        groups = group_vars_by_dims(ds)
+        assert groups == {("x", "y"): ["a", "b"]}
+
+    def test_multiple_dim_groups(self):
+        ds = xr.Dataset(
+            {
+                "surface": (["time", "lat", "lon"], np.zeros((2, 3, 4))),
+                "upper": (
+                    ["time", "lat", "lon", "level"],
+                    np.zeros((2, 3, 4, 5)),
+                ),
+            }
+        )
+        groups = group_vars_by_dims(ds)
+        assert set(groups.keys()) == {
+            ("time", "lat", "lon"),
+            ("time", "lat", "lon", "level"),
+        }
+        assert groups[("time", "lat", "lon")] == ["surface"]
+        assert groups[("time", "lat", "lon", "level")] == ["upper"]
+
+    def test_empty_dataset(self):
+        assert group_vars_by_dims(xr.Dataset()) == {}
+
+    def test_includes_scalar_group(self):
+        """Scalar (0-dim) variables group under the empty dims tuple."""
+        ds = xr.Dataset(
+            {"band": (["y", "x"], np.zeros((2, 3))), "projection": ((), 0)}
+        )
+        groups = group_vars_by_dims(ds)
+        assert groups == {("y", "x"): ["band"], (): ["projection"]}
+
+    def test_ignores_coords(self):
+        """Coordinate variables shouldn't be returned as groups."""
+        ds = xr.Dataset(
+            {"v": (["x"], np.arange(3))},
+            coords={"x": np.arange(3), "label": ("x", ["a", "b", "c"])},
+        )
+        groups = group_vars_by_dims(ds)
+        assert groups == {("x",): ["v"]}

@@ -29,7 +29,6 @@ import xarray as xr
 # Calendar classification
 # ---------------------------------------------------------------------------
 
-#: Calendars close enough to proleptic Gregorian for ``pa.timestamp('us')``.
 GREGORIAN_LIKE_CALENDARS: frozenset[str] = frozenset(
     {
         "standard",
@@ -41,10 +40,13 @@ GREGORIAN_LIKE_CALENDARS: frozenset[str] = frozenset(
         "366_day",
     }
 )
+"""Calendars close enough to proleptic Gregorian for ``pa.timestamp('us')``."""
 
-#: Default CF-convention units when no encoding is available on the coordinate.
-#: Microseconds give sub-second precision and fit int64 for ±292 k years.
 DEFAULT_UNITS: str = "microseconds since 1970-01-01T00:00:00"
+"""Default CF-convention units when no encoding is available on the coordinate.
+
+Microseconds give sub-second precision and fit int64 for ±292 k years.
+"""
 
 
 def is_gregorian_like(calendar: str) -> bool:
@@ -111,7 +113,7 @@ def encoding(ds: xr.Dataset, coord_name: str) -> tuple[str, str]:
     """Return ``(units, calendar)`` for a cftime coordinate.
 
     Reads xarray ``.encoding`` metadata (from the originating NetCDF file)
-    first, falling back to :data:`DEFAULT_UNITS`.
+    first, falling back to [DEFAULT_UNITS][xarray_sql.cftime.DEFAULT_UNITS].
     """
     cal = calendar(ds, coord_name) or "standard"
     enc = ds.coords[coord_name].encoding
@@ -172,18 +174,27 @@ def convert_for_field(values, field: pa.Field) -> np.ndarray:
 
 def partition_bounds(
     values,
-) -> tuple[int, int, str]:
+) -> tuple[int, int, str] | None:
     """Return ``(min, max, dtype_tag)`` for a cftime coordinate slice.
 
     Gregorian-like calendars return nanosecond bounds tagged
     ``"timestamp_ns"`` (compatible with ``ScalarBound::TimestampNanos``
     in the Rust pruning layer).  Non-Gregorian calendars return int64
     offsets tagged ``"int64"``.
+
+    Returns ``None`` when the nanosecond bound falls outside the int64 range
+    (e.g. paleoclimate dates before ~1678), signalling the caller to skip
+    pruning for that dimension rather than emit a bound the Rust layer would
+    reject.
     """
     cal = values.ravel()[0].calendar
     if is_gregorian_like(cal):
         us = to_microseconds(values)
-        return int(us.min()) * 1_000, int(us.max()) * 1_000, "timestamp_ns"
+        lo, hi = int(us.min()) * 1_000, int(us.max()) * 1_000
+        int64 = np.iinfo(np.int64)
+        if lo < int64.min or hi > int64.max:
+            return None
+        return lo, hi, "timestamp_ns"
     offsets = to_offsets(values, DEFAULT_UNITS, cal)
     return int(offsets.min()), int(offsets.max()), "int64"
 
